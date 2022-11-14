@@ -920,6 +920,7 @@ import (
 	EnforcedOrNot		"{ENFORCED|NOT ENFORCED}"
 	EnforcedOrNotOpt	"Optional {ENFORCED|NOT ENFORCED}"
 	EnforcedOrNotOrNotNullOpt	"{[ENFORCED|NOT ENFORCED|NOT NULL]}"
+	JoinCondition		"join_specification"
 
 %type	<ident>
 	AsOpt			"AS or EmptyString"
@@ -3803,22 +3804,42 @@ IndexHintListOpt:
 		$$ = $1
 	}
 
+//JoinTable:
+//	/* Use %prec to evaluate production TableRef before cross join */
+//	TableRef CrossOpt TableRef %prec tableRefPriority
+//	{
+//		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $3.(ast.ResultSetNode), Tp: ast.CrossJoin}
+//	}
+//	/* Project 2: your code here.
+//	 * You can see details about JoinTable in https://dev.mysql.com/doc/refman/8.0/en/join.html
+//	 *
+//	 * joined_table: {
+//         *     table_reference {[INNER | CROSS] JOIN | STRAIGHT_JOIN} table_factor [join_specification]
+//         *   | table_reference {LEFT|RIGHT} [OUTER] JOIN table_reference join_specification
+//         *   | table_reference NATURAL [INNER | {LEFT|RIGHT} [OUTER]] JOIN table_factor
+//         * }
+//         *
+//	 */
+
 JoinTable:
-	/* Use %prec to evaluate production TableRef before cross join */
 	TableRef CrossOpt TableRef %prec tableRefPriority
 	{
 		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $3.(ast.ResultSetNode), Tp: ast.CrossJoin}
 	}
-	/* Project 2: your code here.
-	 * You can see details about JoinTable in https://dev.mysql.com/doc/refman/8.0/en/join.html
-	 *
-	 * joined_table: {
-         *     table_reference {[INNER | CROSS] JOIN | STRAIGHT_JOIN} table_factor [join_specification]
-         *   | table_reference {LEFT|RIGHT} [OUTER] JOIN table_reference join_specification
-         *   | table_reference NATURAL [INNER | {LEFT|RIGHT} [OUTER]] JOIN table_factor
-         * }
-         *
-	 */
+|	TableRef JoinType "JOIN" TableRef JoinCondition
+	{
+		st := &ast.Join{Left: $1.(ast.ResultSetNode), Right: $4.(ast.ResultSetNode), Tp: $2.(ast.JoinType)}
+		if $5 != nil {
+			st.On = $5.(*ast.OnCondition)
+		}
+		$$ = st
+	}
+
+JoinCondition:
+   "ON" Expression
+	{
+		$$ = &ast.OnCondition{Expr: $2}
+	}
 
 JoinType:
 	"LEFT"
