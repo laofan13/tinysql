@@ -15,6 +15,8 @@ package ddl
 
 import (
 	"fmt"
+	"sync/atomic"
+
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/infoschema"
@@ -26,7 +28,6 @@ import (
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/sqlexec"
 	"go.uber.org/zap"
-	"sync/atomic"
 )
 
 // adjustColumnInfoInAddColumn is used to set the correct position of column info when adding column.
@@ -196,16 +197,33 @@ func onAddColumn(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, err error)
 	switch columnInfo.State {
 	case model.StateNone:
 		// To be filled
+		// none -> delete only
+		job.SchemaState = model.StateDeleteOnly
+		columnInfo.State = model.StateDeleteOnly
 		ver, err = updateVersionAndTableInfoWithCheck(t, job, tblInfo, originalState != columnInfo.State)
 	case model.StateDeleteOnly:
 		// To be filled
+		// delete only -> write only
+		job.SchemaState = model.StateWriteOnly
+		columnInfo.State = model.StateWriteOnly
 		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != columnInfo.State)
 	case model.StateWriteOnly:
 		// To be filled
+		// write only -> reorganization
+		job.SchemaState = model.StateWriteReorganization
+		columnInfo.State = model.StateWriteReorganization
 		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != columnInfo.State)
 	case model.StateWriteReorganization:
 		// To be filled
+		// reorganization -> public
+		columnInfo.State = model.StatePublic
+		adjustColumnInfoInAddColumn(tblInfo, offset)
 		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != columnInfo.State)
+		if err != nil {
+			return ver, errors.Trace(err)
+		}
+		// Finish this job.
+		job.FinishTableJob(model.JobStateDone, model.StatePublic, ver, tblInfo)
 	default:
 		err = ErrInvalidDDLState.GenWithStackByArgs("column", columnInfo.State)
 	}
@@ -234,7 +252,7 @@ func onAddColumn(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, err error)
  *       - Remember use `FinishTableJob` to finish the job.
  *       - Don't forget to do something, if this is a rolling back add column job.
  */
-func onDropColumn(t *meta.Meta, job *model.Job) (ver int64, _ error) {
+func onDropColumn(t *meta.Meta, job *model.Job) (ver int64, err error) {
 	tblInfo, colInfo, err := checkDropColumn(t, job)
 	if err != nil {
 		return ver, errors.Trace(err)
@@ -246,19 +264,61 @@ func onDropColumn(t *meta.Meta, job *model.Job) (ver int64, _ error) {
 	switch colInfo.State {
 	case model.StatePublic:
 		// To be filled
+		// public -> write only
+		job.SchemaState = model.StateWriteOnly
+		colInfo.State = model.StateWriteOnly
+		adjustColumnInfoInDropColumn(tblInfo, colInfo.Offset)
+
+		odValue, err := generateOriginDefaultValue(colInfo)
+		if err != nil {
+			return ver, errors.Trace(err)
+		}
+		colInfo.DefaultValue = odValue
+
 		ver, err = updateVersionAndTableInfoWithCheck(t, job, tblInfo, originalState != colInfo.State)
 	case model.StateWriteOnly:
 		// To be filled
+		// write only -> delete only
+		job.SchemaState = model.StateDeleteOnly
+		colInfo.State = model.StateDeleteOnly
 		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != colInfo.State)
 	case model.StateDeleteOnly:
 		// To be filled
+		// delete only -> reorganization
+		job.SchemaState = model.StateDeleteReorganization
+		colInfo.State = model.StateDeleteReorganization
 		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != colInfo.State)
 	case model.StateDeleteReorganization:
 		// To be filled
+		// reorganization -> absent
+		newCols := make([]*model.ColumnInfo, 0, len(tblInfo.Columns))
+		for _, col := range tblInfo.Columns {
+			if col.Name.L != colInfo.Name.L {
+				newCols = append(newCols, col)
+			}
+		}
+		tblInfo.Columns = newCols
+
+		colInfo.State = model.StateNone
 		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != colInfo.State)
+		if err != nil {
+			return ver, errors.Trace(err)
+		}
+		// Finish this job.
+		if job.IsRollingback() {
+			ver, err = onAddColumn(nil, t, job)
+			if err != nil {
+				return ver, errors.Trace(err)
+			}
+			return ver, nil
+		} else {
+			job.FinishTableJob(model.JobStateDone, model.StateNone, ver, tblInfo)
+		}
+
 	default:
 		err = errInvalidDDLJob.GenWithStackByArgs("table", tblInfo.State)
 	}
+
 	return ver, errors.Trace(err)
 }
 
