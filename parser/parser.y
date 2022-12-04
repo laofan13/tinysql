@@ -3825,6 +3825,14 @@ JoinTable:
 	{
 		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $3.(ast.ResultSetNode), Tp: ast.CrossJoin}
 	}
+|   TableRef CrossOpt TableRef "ON" Expression
+	{
+		st := &ast.Join{Left: $1.(ast.ResultSetNode), Right: $5.(ast.ResultSetNode), Tp: ast.CrossJoin}
+		if $5 != nil {
+			st.On = &ast.OnCondition{Expr: $5}
+		}
+		$$ = st
+	}
 |	TableRef JoinType OuterOpt "JOIN" TableRef "ON" Expression
 	{
 		st := &ast.Join{Left: $1.(ast.ResultSetNode), Right: $5.(ast.ResultSetNode), Tp: $2.(ast.JoinType)}
@@ -3851,7 +3859,6 @@ OuterOpt:
 CrossOpt:
 	"JOIN"
 |	"INNER" "JOIN"
-
 
 LimitClause:
 	{
