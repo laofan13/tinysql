@@ -8129,7 +8129,7 @@ yynewstate:
 		}
 	case 873:
 		{
-			st := &ast.Join{Left: yyS[yypt-4].item.(ast.ResultSetNode), Right: yyS[yypt-0].expr.(ast.ResultSetNode), Tp: ast.CrossJoin}
+			st := &ast.Join{Left: yyS[yypt-4].item.(ast.ResultSetNode), Right: yyS[yypt-2].item.(ast.ResultSetNode), Tp: ast.CrossJoin}
 			if yyS[yypt-0].expr != nil {
 				st.On = &ast.OnCondition{Expr: yyS[yypt-0].expr}
 			}
