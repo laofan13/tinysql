@@ -29,6 +29,7 @@ import (
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/set"
+	"github.com/spaolacci/murmur3"
 	"go.uber.org/zap"
 )
 
@@ -95,42 +96,44 @@ type AfFinalResult struct {
 // and updates all the items in PartialAggFuncs.
 // The parallel execution flow is as the following graph shows:
 //
-//                            +-------------+
-//                            | Main Thread |
-//                            +------+------+
-//                                   ^
-//                                   |
-//                                   +
-//                              +-+-            +-+
-//                              | |    ......   | |  finalOutputCh
-//                              +++-            +-+
-//                               ^
-//                               |
-//                               +---------------+
-//                               |               |
-//                 +--------------+             +--------------+
-//                 | final worker |     ......  | final worker |
-//                 +------------+-+             +-+------------+
-//                              ^                 ^
-//                              |                 |
-//                             +-+  +-+  ......  +-+
-//                             | |  | |          | |
-//                             ...  ...          ...    partialOutputChs
-//                             | |  | |          | |
-//                             +++  +++          +++
-//                              ^    ^            ^
-//          +-+                 |    |            |
-//          | |        +--------o----+            |
+//	                  +-------------+
+//	                  | Main Thread |
+//	                  +------+------+
+//	                         ^
+//	                         |
+//	                         +
+//	                    +-+-            +-+
+//	                    | |    ......   | |  finalOutputCh
+//	                    +++-            +-+
+//	                     ^
+//	                     |
+//	                     +---------------+
+//	                     |               |
+//	       +--------------+             +--------------+
+//	       | final worker |     ......  | final worker |
+//	       +------------+-+             +-+------------+
+//	                    ^                 ^
+//	                    |                 |
+//	                   +-+  +-+  ......  +-+
+//	                   | |  | |          | |
+//	                   ...  ...          ...    partialOutputChs
+//	                   | |  | |          | |
+//	                   +++  +++          +++
+//	                    ^    ^            ^
+//	+-+                 |    |            |
+//	| |        +--------o----+            |
+//
 // inputCh  +-+        |        +-----------------+---+
-//          | |        |                              |
-//          ...    +---+------------+            +----+-----------+
-//          | |    | partial worker |   ......   | partial worker |
-//          +++    +--------------+-+            +-+--------------+
-//           |                     ^                ^
-//           |                     |                |
-//      +----v---------+          +++ +-+          +++
-//      | data fetcher | +------> | | | |  ......  | |   partialInputChs
-//      +--------------+          +-+ +-+          +-+
+//
+//	    | |        |                              |
+//	    ...    +---+------------+            +----+-----------+
+//	    | |    | partial worker |   ......   | partial worker |
+//	    +++    +--------------+-+            +-+--------------+
+//	     |                     ^                ^
+//	     |                     |                |
+//	+----v---------+          +++ +-+          +++
+//	| data fetcher | +------> | | | |  ......  | |   partialInputChs
+//	+--------------+          +-+ +-+          +-+
 type HashAggExec struct {
 	baseExecutor
 
@@ -353,6 +356,24 @@ func (w *HashAggPartialWorker) updatePartialResult(ctx sessionctx.Context, sc *s
 // We only support parallel execution for single-machine, so process of encode and decode can be skipped.
 func (w *HashAggPartialWorker) shuffleIntermData(sc *stmtctx.StatementContext, finalConcurrency int) {
 	// TODO: implement the method body. Shuffle the data to final workers.
+	shuffleGroupKeys := make([][]string, finalConcurrency)
+	for groupKey := range w.partialResultsMap {
+		finalWorkerIdx := int(murmur3.Sum32([]byte(groupKey))) % finalConcurrency
+		if shuffleGroupKeys[finalWorkerIdx] == nil {
+			shuffleGroupKeys[finalWorkerIdx] = make([]string, 0, len(w.partialResultsMap)/finalConcurrency)
+		}
+		shuffleGroupKeys[finalWorkerIdx] = append(shuffleGroupKeys[finalWorkerIdx], groupKey)
+	}
+
+	for i := range shuffleGroupKeys {
+		if shuffleGroupKeys[i] == nil {
+			continue
+		}
+		w.outputChs[i] <- &HashAggIntermData{
+			groupKeys:        shuffleGroupKeys[i],
+			partialResultMap: w.partialResultsMap,
+		}
+	}
 }
 
 // getGroupKey evaluates the group items and args of aggregate functions.
@@ -423,7 +444,41 @@ func (w *HashAggFinalWorker) getPartialInput() (input *HashAggIntermData, ok boo
 
 func (w *HashAggFinalWorker) consumeIntermData(sctx sessionctx.Context) (err error) {
 	// TODO: implement the method body. This method consumes the data given by the partial workers.
-	return nil
+	var (
+		input            *HashAggIntermData
+		ok               bool
+		intermDataBuffer [][]aggfuncs.PartialResult
+		groupKeys        []string
+	)
+	for {
+		if input, ok = w.getPartialInput(); !ok {
+			return nil
+		}
+		if intermDataBuffer == nil {
+			intermDataBuffer = make([][]aggfuncs.PartialResult, 0, w.maxChunkSize)
+		}
+		for reachEnd := false; !reachEnd; {
+			intermDataBuffer, groupKeys, reachEnd = input.getPartialResultBatch(sctx.GetSessionVars().StmtCtx, intermDataBuffer[:0], w.aggFuncs, w.maxChunkSize)
+			w.groupKeys = w.groupKeys[:0]
+			for _, groupKey := range groupKeys {
+				w.groupKeys = append(w.groupKeys, []byte(groupKey))
+			}
+
+			finalPartialResults := w.getPartialResult(sctx.GetSessionVars().StmtCtx, w.groupKeys, w.partialResultMap)
+			for i, groupKey := range groupKeys {
+				if !w.groupSet.Exist(groupKey) {
+					w.groupSet.Insert(groupKey)
+				}
+				prs := intermDataBuffer[i]
+				for j, af := range w.aggFuncs {
+					err := af.MergePartialResult(sctx, prs[j], finalPartialResults[i][j])
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
 }
 
 func (w *HashAggFinalWorker) getFinalResult(sctx sessionctx.Context) {
