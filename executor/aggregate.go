@@ -452,7 +452,7 @@ func (w *HashAggFinalWorker) consumeIntermData(sctx sessionctx.Context) (err err
 	)
 	for {
 		if input, ok = w.getPartialInput(); !ok {
-			return nil
+			break
 		}
 		if intermDataBuffer == nil {
 			intermDataBuffer = make([][]aggfuncs.PartialResult, 0, w.maxChunkSize)
@@ -479,6 +479,7 @@ func (w *HashAggFinalWorker) consumeIntermData(sctx sessionctx.Context) (err err
 			}
 		}
 	}
+	return nil
 }
 
 func (w *HashAggFinalWorker) getFinalResult(sctx sessionctx.Context) {
