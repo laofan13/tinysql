@@ -148,9 +148,30 @@ func (s *tikvSnapshot) get(bo *Backoffer, k kv.Key) ([]byte, error) {
 			//   1. The transaction is during commit, wait for a while and retry.
 			//   2. The transaction is dead with some locks left, resolve it.
 			// YOUR CODE HERE (proj6).
-			// panic("YOUR CODE HERE")
-			continue
+			l, err := extractLockFromKeyErr(keyErr)
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
 
+			status, err := cli.getTxnStatusFromLock(bo, l,0)
+			if err != nil {
+				err = errors.Trace(err)
+				return nil, errors.Trace(err)
+			}
+			if status.ttl == 0 { 
+				cleanRegions := make(map[RegionVerID]struct{})
+				err = cli.resolveLock(bo, l, status, cleanRegions)
+				if err != nil {
+					return  nil, errors.Trace(err)
+				}
+			}else{
+				msBeforeLockExpired := cli.store.GetOracle().UntilExpired(l.TxnID, status.ttl)
+				err = bo.BackoffWithMaxSleep(BoTxnLock, int(msBeforeLockExpired), errors.New(keyErr.String()))
+				if err != nil {
+					return nil, errors.Trace(err)
+				}
+			}
+			continue
 		}
 		return val, nil
 	}
