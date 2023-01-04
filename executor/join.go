@@ -179,7 +179,10 @@ func (e *HashJoinExec) fetchAndBuildHashTable(ctx context.Context) error {
 		if rowCount == 0 {
 			break
 		}
-		e.rowContainer.PutChunk(chk)
+		err = e.rowContainer.PutChunk(chk)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -293,15 +296,15 @@ func (e *HashJoinExec) runJoinWorker(workerID uint, outerKeyColIdx []int) {
 
 	// join
 	outerAllTypes := make([]*types.FieldType, len(e.outerKeys))
-	for i := range e.outerKeys {
-		outerAllTypes[i] = e.outerKeys[i].RetType
+	for i, keyColIdx := range outerKeyColIdx {
+		outerAllTypes[i] = e.outerKeys[keyColIdx].RetType
 	}
 	hCtx := &hashContext{
 		allTypes:  outerAllTypes,
 		keyColIdx: outerKeyColIdx,
 	}
 
-	for {
+	for ok := true; ok;{
 		select {
 		case <-e.closeCh:
 			return
